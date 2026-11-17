@@ -1,10 +1,11 @@
 # 深度登记 costsplit（数仓查询成本分摊与预算闸门）
 
-- 规模：中型（7 个功能模块 / 7 个页面 / 91 条测试）
+- 规模：中型（8 个功能模块 / 7 个页面 / 115 条测试）
 - 核心规则一：**单查询成本** = 扫描量折算 GB × 扫描单价 + 按小时桶切分的时长 × 时段单价 + 并发加价，按 (priority, id) 顺序作用四条规则后量化到分。
 - 核心规则二：**共享查询分摊** = 部门时长(小时) × 部门扫描量(GB) 作权重，最大余额法分配到分，份额合计恒等于该查询成本；权重全零进未分摊。
 - 核心规则三：**预算闸门** = 按 收益分/成本 降序放行，累计不超过部门预算（区间 (0, budget]），其余截断；部门缺预算整体截断。
 - 核心规则四：**申诉改判** = 只改登记的几列（归属部门 / 开始时间 / 时长 / 扫描量 / 单位），改判后整批重算；同一查询多条申诉按改判内容去重，改判目标冲突时保留最早一条；结论写成新版本，回滚按旧快照再写一个新版本。
+- 核心规则五：**月度预算账本** = (部门, 月份) 一本账，跨批次共用；预占按预估费用守预算（已用 + 预占中 + 本次预估 ≤ 预算，BEGIN IMMEDIATE 事务内判定）；结算按实际费用全额记账，超额部分成欠额（max(0, 已用 − 预算)）并阻止新预占；回执按 receipt_id 幂等，撤销只释放未执行预占，晚到回执仍全额计费；不做跨月结转。
 - 使用者与工作流：云格 SaaS 数据平台组 8 人，月账单 42 万，原先由会计把共享查询的成本手工拆给部门；现在导入查询账单即可得到「部门分摊 + 未分摊 + 预算内/被截断 + 逐行证据」。
 
 ## 功能模块
@@ -18,6 +19,7 @@
 | M5 预算闸门与批次 | 重算闸门、看排序决策、看批次清单 | POST /api/gates、GET /api/gates、GET /api/batches、页面 /gates 与 /batches | `app/modules/m5_gate/gate.py` `app/modules/m5_gate/batchkey.py` `app/modules/m5_gate/state.py` `app/modules/m5_gate/service.py` | `tests/test_gate.py` |
 | M6 账单导出 | 导出账单/隔离/份额/决策/运行清单/收据 | GET /api/export、页面 /export | `app/modules/m6_export/csv_out.py` `app/modules/m6_export/json_out.py` `app/modules/m6_export/receipt.py` `app/modules/m6_export/service.py` | `tests/test_export.py` |
 | M7 预算申诉与回滚 | 提交申诉改判归属、看重算差异、按时段复核、回滚到旧版本 | POST /api/appeals、POST /api/appeals/rollback、GET /api/appeals、页面 /appeals | `app/modules/m7_appeal/appeal.py` `app/modules/m7_appeal/buckets.py` `app/modules/m7_appeal/rollback.py` `app/modules/m7_appeal/service.py` `app/modules/m7_appeal/handler.py` | `tests/test_m7_appeal.py` `tests/test_m7_rollback.py` |
+| M8 月度预算账本 | 设部门月度预算、跨批次预占、回执结算、撤销、查已用/预占/可用/欠额 | PUT /api/ledger/budget、POST /api/ledger/reserve、POST /api/ledger/settle、POST /api/ledger/cancel、GET /api/ledger/status | `app/modules/m8_ledger/ledger.py` `app/modules/m8_ledger/service.py` `app/modules/m8_ledger/handler.py` `app/store.py`（账本表与原子操作） | `tests/test_ledger.py` |
 
 端到端：`tests/test_e2e.py`（脏样例 → 隔离 → 计费 → 分摊 → 闸门 → 导出，含失败输入与幂等重跑）。
 v2 的申诉链路：`tests/test_m7_appeal.py`（改判 → 重算 → 时段复核）与 `tests/test_m7_rollback.py`（版本快照 → 差异 → 回滚）。
@@ -43,6 +45,10 @@ v2 的申诉链路：`tests/test_m7_appeal.py`（改判 → 重算 → 时段复
 | TRAP-26 | 两个人同时改预算，旧页面后提交 | 后提交无条件覆盖新结论 | 批次 version 乐观锁，`expected_version` 落后返回 409 | `app/modules/m5_gate/batchkey.py` | `tests/test_gate.py::test_trap26_stale_version_is_rejected` |
 | TRAP-27 | 申诉把查询改到 23:30 起 1.5 小时，零点后那 1 小时被丢掉 | 只按起始小时或截到当天 24:00 计价，跨零点部分少算 | 左闭右开逐桶切、跨日续切，并用独立分桶路径与计费金额对账（`Q_APPEAL_BUCKET`） | `app/modules/m7_appeal/buckets.py` | `tests/test_m7_appeal.py::test_trap27_hours_after_midnight_are_not_dropped` |
 | TRAP-28 | 申诉把一条查询从 A 部门改到 B 部门 | 只往新部门加、不从旧部门减，总额被算重一遍 | 改判后整批重算份额与部门账，落库前校验 总额 = 分摊 + 未分摊、分摊 = 保留 + 截断 | `app/modules/m7_appeal/service.py` | `tests/test_m7_appeal.py::test_trap28_rejudgement_keeps_total_conserved` |
+| TRAP-29 | 多个批次同时按预估费用申请额度 | 先查后写两步行，并发各自看到旧可用额，预占合计超过预算 | BEGIN IMMEDIATE 事务里判定 + 落行，写者串行化；16 并发抢 1000 元预算恰好放行 10 笔 | `app/store.py`（`ledger_reserve`） | `tests/test_ledger.py::test_trap29_concurrent_reserves_never_overcommit` |
+| TRAP-30 | 执行回执网络重试/重复投递 | 同一回执记两次实账，部门被重复扣费 | receipt_id 作 settlements 主键，同参重放返回首次结果，异参重放 409 | `app/store.py`（`ledger_settle`） | `tests/test_ledger.py::test_trap30_replayed_receipt_is_not_charged_twice` |
+| TRAP-31 | 结算中途断电：预占已释放、实账没记（或反之） | 额度凭空消失或费用丢账，恢复后无从对账 | 释放预占与记实账在同一事务，同成同败；恢复后用同一 receipt_id 重试即补记，且只记一次 | `app/store.py`（`ledger_settle`） | `tests/test_ledger.py::test_trap31_crash_mid_settle_rolls_back_and_replay_recovers` |
+| TRAP-32 | 预占撤销后，已执行的回执晚到 | 撤销即丢账，实际发生的费用没人付 | 晚到回执仍全额记账（`late=1`），允许形成欠额；撤销事实不被改写 | `app/store.py`（`ledger_settle`） | `tests/test_ledger.py::test_trap32_late_receipt_after_cancel_is_still_charged` |
 
 ## 对账规则
 
@@ -62,13 +68,16 @@ v2 的申诉链路：`tests/test_m7_appeal.py`（改判 → 重算 → 时段复
 - 反例（v2）：`test_trap27_appeal_reprice_uses_each_hour_bucket`（整段按起始时段算得 84 分，逐桶算 53 分）、`test_trap27_hours_after_midnight_are_not_dropped`（只算首小时得 11 分，续切得 32 分）、`test_trap28_rejudgement_keeps_total_conserved`（只加不减把总额算成 7182 + 358）。
 - 不变量（改判守恒）：`tests/test_m7_appeal.py::test_trap28_rejudgement_keeps_total_conserved`、`tests/test_m7_rollback.py::test_rollback_keeps_amount_account_balanced`。
 - 不变量（重放幂等）：`tests/test_m7_appeal.py::test_replaying_same_appeal_keeps_dept_totals`（同一条申诉再提交，部门分摊不变，只升版本）。
+- 不变量（账本幂等）：`tests/test_ledger.py::test_trap30_replayed_receipt_is_not_charged_twice`、`test_reserve_replay_with_same_id_is_idempotent`（回执与预占重试都只生效一次）。
+- 不变量（账本守恒）：`tests/test_ledger.py::test_trap29_concurrent_reserves_never_overcommit`（并发预占合计 ≤ 预算）、`test_no_cross_month_carryover`（每月独立成账，欠额不滚入次月）。
 - 端到端：`tests/test_e2e.py::test_dirty_sample_runs_from_import_to_export`。
 
 ## 已知不覆盖
 
 - 只支持单个 CSV 账单文件；不做多文件拼接与跨月合并，月份归属靠文件名与记录时间人工对齐。
-- 预算只按部门一档，没有项目级、月度滚动与跨期结转。
+- 预算只按部门一档，没有项目级、月度滚动与跨期结转；月度账本每月独立成账，欠额不滚入次月，次月预算需单独设定。
 - 共享查询的权重取「部门时长 × 部门扫描量」，不区分读写类型，也不做按列裁剪的细粒度计量。
 - 闸门只做一次性排序截断，没有分阶段配额（先保生产再保探索）；申诉是逐条改判，不支持成批合并成一版。
 - 申诉只能改登记的几列；改原始字段（并发、收益分）要重新导入。版本快照只保留在当前批次，重新导入会重建。
+- 月度账本只有 JSON 接口没有页面；预占不设自动过期，靠结算或撤销释放；批次号只作来源记录，不校验批次是否存在。
 - 时间只处理带偏移与 `+08:00` 本地两种写法，历史数据里的纯 UTC 秒级时间戳需要先转 ISO。

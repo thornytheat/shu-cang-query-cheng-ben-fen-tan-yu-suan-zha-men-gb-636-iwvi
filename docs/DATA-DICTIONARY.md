@@ -87,3 +87,26 @@
 | 版本 | 每次结论变化写一个新版本，版本号只增不减；回滚按旧快照写成新版本，旧版本快照不被修改 |
 | 快照 | 每次导入、闸门重算、申诉、回滚各留一份 depts/gates/shares/totals/账单成本，回滚只认这些快照 |
 | 并发 | 提交带 `expected_version`，落后返回 409 `Q_STALE_VERSION`，不覆盖别人的结论 |
+
+## 10 月度预算账本（M8）
+
+| 表 | 行含义 | 关键列 |
+|---|---|---|
+| `dept_budgets` | 一个部门一个月一行预算 | `dept`、`month`(YYYY-MM)、`budget_cents`；主键 (dept, month)，覆盖即最新 |
+| `reservations` | 一笔预占（跨批次共用部门月度预算） | `reservation_id` 主键、`dept`、`month`、`batch_id`（来源批次，仅记录不校验）、`estimate_cents`、`status`(HELD/SETTLED/CANCELLED) |
+| `settlements` | 一张已执行回执的实账 | `receipt_id` 主键（幂等键）、`reservation_id`、`dept`、`month`、`actual_cents`、`late`（撤销后晚到 = 1） |
+
+| 读数 | 定义 |
+|---|---|
+| 已用 `used_cents` | 当月 settlements 的 `actual_cents` 合计（全额实账，不截断） |
+| 预占 `held_cents` | 当月 HELD 状态 reservations 的 `estimate_cents` 合计 |
+| 可用 `available_cents` | max(0, 预算 − 已用 − 预占) |
+| 欠额 `deficit_cents` | max(0, 已用 − 预算)；只认已记账的实际费用，欠额在账时新预占一律拒绝 |
+
+| 规则 | 定义 |
+|---|---|
+| 预占 | 已用 + 预占中 + 本次预估 ≤ 预算 才放行；判定与落行在同一 BEGIN IMMEDIATE 事务，并发不超卖 |
+| 结算 | 释放预占与记实账同事务同成同败；`receipt_id` 幂等，同参重放返回首次结果，异参重放 409 |
+| 撤销 | 只释放未执行（HELD）的预占；已结算不能撤销；重复撤销幂等 |
+| 晚到回执 | 预占已撤销仍全额记账（`late=1`），允许形成欠额；撤销事实不被改写 |
+| 月度 | 账记到预占所属月份；每月独立成账，不做跨月结转，欠额不滚入次月 |

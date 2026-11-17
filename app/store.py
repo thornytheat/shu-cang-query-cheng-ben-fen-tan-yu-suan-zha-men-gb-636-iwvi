@@ -90,6 +90,36 @@ CREATE TABLE IF NOT EXISTS snapshots (
     state_json TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_snapshots ON snapshots(batch_id, version);
+-- M8 月度预算账本：按 (部门, 月份) 独立成账，跨批次共用，不做跨月结转
+CREATE TABLE IF NOT EXISTS dept_budgets (
+    dept TEXT NOT NULL,
+    month TEXT NOT NULL,
+    budget_cents INTEGER NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (dept, month)
+);
+CREATE TABLE IF NOT EXISTS reservations (
+    reservation_id TEXT PRIMARY KEY,
+    dept TEXT NOT NULL,
+    month TEXT NOT NULL,
+    batch_id TEXT NOT NULL,
+    estimate_cents INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reservations_hold
+    ON reservations(dept, month, status);
+CREATE TABLE IF NOT EXISTS settlements (
+    receipt_id TEXT PRIMARY KEY,
+    reservation_id TEXT NOT NULL,
+    dept TEXT NOT NULL,
+    month TEXT NOT NULL,
+    actual_cents INTEGER NOT NULL,
+    late INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_settlements_dept ON settlements(dept, month);
 """
 
 TABLES = ("bills", "quarantine", "shares", "depts", "gates", "stages", "totals",
@@ -122,9 +152,14 @@ class Store:
             conn.executescript(SCHEMA)
 
     @contextmanager
-    def connect(self):
+    def connect(self, *, immediate: bool = False):
+        """immediate=True 时显式 BEGIN IMMEDIATE：读-改-写在同一事务里串行化，
+        并发写不会拿着过期快照提交（预占/结算靠它守住额度、保证同成同败）。"""
         conn = sqlite3.connect(self.path, timeout=15.0)
         conn.row_factory = sqlite3.Row
+        if immediate:
+            conn.isolation_level = None
+            conn.execute("BEGIN IMMEDIATE")
         try:
             yield conn
             conn.commit()
@@ -559,6 +594,242 @@ class Store:
                     f"SELECT COUNT(*) AS n FROM {table} WHERE batch_id=?",
                     (batch_id,)).fetchone()["n"]
         return out
+
+    # ---------- M8 月度预算账本：预占 / 结算 / 撤销 ----------
+    # 账本是跨批次的 (部门, 月份) 账，不进 save_run 的整批删插，也不随批次重建。
+    def ledger_set_budget(self, *, dept: str, month: str, budget_cents: int,
+                          now: str) -> dict:
+        """设定（或调整）部门月度预算；同部门同月覆盖即最新值。"""
+        with self.connect(immediate=True) as conn:
+            conn.execute(
+                """INSERT INTO dept_budgets (dept,month,budget_cents,updated_at)
+                   VALUES (?,?,?,?)
+                   ON CONFLICT(dept,month) DO UPDATE SET
+                     budget_cents=excluded.budget_cents,
+                     updated_at=excluded.updated_at""",
+                (dept, month, int(budget_cents), now))
+            return self._ledger_status(conn, dept, month)
+
+    def ledger_status(self, dept: str, month: str) -> dict:
+        with self.connect() as conn:
+            return self._ledger_status(conn, dept, month)
+
+    def _ledger_status(self, conn, dept: str, month: str) -> dict:
+        from .modules.m8_ledger import ledger
+        row = conn.execute(
+            "SELECT budget_cents FROM dept_budgets WHERE dept=? AND month=?",
+            (dept, month)).fetchone()
+        used, held = self._ledger_sums(conn, dept, month)
+        return ledger.summarize(
+            dept=dept, month=month,
+            budget_cents=None if row is None else int(row["budget_cents"]),
+            used_cents=used, held_cents=held)
+
+    def _ledger_sums(self, conn, dept: str, month: str) -> tuple[int, int]:
+        used = conn.execute(
+            "SELECT COALESCE(SUM(actual_cents),0) AS s FROM settlements "
+            "WHERE dept=? AND month=?", (dept, month)).fetchone()["s"]
+        held = conn.execute(
+            "SELECT COALESCE(SUM(estimate_cents),0) AS s FROM reservations "
+            "WHERE dept=? AND month=? AND status='HELD'",
+            (dept, month)).fetchone()["s"]
+        return int(used), int(held)
+
+    def ledger_reserve(self, *, dept: str, month: str, batch_id: str,
+                       estimate_cents: int, reservation_id: str | None,
+                       now: str) -> dict:
+        """预占：BEGIN IMMEDIATE 事务里查可用额度并落预占行，并发不重复占用。
+
+        reservation_id 由调用方提供时按幂等键处理：同参重放返回原行，
+        异参重放拒绝（409），中断恢复时重试安全。
+        """
+        from . import errors
+        from .modules.m8_ledger import ledger
+        with self.connect(immediate=True) as conn:
+            if reservation_id is not None:
+                row = conn.execute(
+                    "SELECT * FROM reservations WHERE reservation_id=?",
+                    (reservation_id,)).fetchone()
+                if row is not None:
+                    existing = dict(row)
+                    same = (existing["dept"] == dept
+                            and existing["month"] == month
+                            and existing["batch_id"] == batch_id
+                            and int(existing["estimate_cents"])
+                            == int(estimate_cents))
+                    if not same:
+                        raise errors.Conflict(
+                            f"reservation_id={reservation_id} 已存在且参数不同",
+                            code="Q_LEDGER_RESERVE_CONFLICT",
+                            detail={"reservation_id": reservation_id})
+                    return {"reservation": existing, "duplicate": True,
+                            "status": self._ledger_status(conn, dept, month)}
+            row = conn.execute(
+                "SELECT budget_cents FROM dept_budgets WHERE dept=? AND month=?",
+                (dept, month)).fetchone()
+            if row is None:
+                raise errors.NotFound(
+                    f"{dept} {month} 未设预算，不能预占",
+                    code="Q_LEDGER_NO_BUDGET",
+                    detail={"dept": dept, "month": month})
+            used, held = self._ledger_sums(conn, dept, month)
+            ledger.ensure_reservable(
+                dept=dept, month=month, budget_cents=int(row["budget_cents"]),
+                used_cents=used, held_cents=held, estimate_cents=estimate_cents)
+            rid = reservation_id or ledger.new_reservation_id()
+            conn.execute(
+                """INSERT INTO reservations (reservation_id,dept,month,batch_id,
+                       estimate_cents,status,created_at,updated_at)
+                   VALUES (?,?,?,?,?,'HELD',?,?)""",
+                (rid, dept, month, batch_id, int(estimate_cents), now, now))
+            reservation = {"reservation_id": rid, "dept": dept, "month": month,
+                           "batch_id": batch_id,
+                           "estimate_cents": int(estimate_cents),
+                           "status": "HELD", "created_at": now, "updated_at": now}
+            return {"reservation": reservation, "duplicate": False,
+                    "status": self._ledger_status(conn, dept, month)}
+
+    def ledger_settle(self, *, receipt_id: str, reservation_id: str,
+                      actual_cents: int, now: str) -> dict:
+        """结算：同一事务里释放预占 + 记实账，同成同败；中断重试不重复扣费。
+
+        - receipt_id 是幂等键：同参重放返回首次结果，异参重放拒绝（409）；
+        - 实际费用全额记账，允许超过预算，超额部分由状态里的欠额反映；
+        - 预占已撤销时回执仍全额记账（late=1），不截断、不丢账；
+        - 实账记到预占所属月份，不做跨月结转。
+        """
+        from . import errors
+        with self.connect(immediate=True) as conn:
+            row = conn.execute("SELECT * FROM settlements WHERE receipt_id=?",
+                               (receipt_id,)).fetchone()
+            if row is not None:
+                existing = dict(row)
+                if (existing["reservation_id"] != reservation_id
+                        or int(existing["actual_cents"]) != int(actual_cents)):
+                    raise errors.Conflict(
+                        f"receipt_id={receipt_id} 已记账，重放参数不一致",
+                        code="Q_LEDGER_RECEIPT_CONFLICT",
+                        detail={"receipt_id": receipt_id,
+                                "recorded": {
+                                    "reservation_id":
+                                        existing["reservation_id"],
+                                    "actual_cents":
+                                        int(existing["actual_cents"])},
+                                "rejected": {
+                                    "reservation_id": reservation_id,
+                                    "actual_cents": int(actual_cents)}})
+                return {"settlement": existing, "duplicate": True,
+                        "late": bool(existing["late"]),
+                        "status": self._ledger_status(conn, existing["dept"],
+                                                      existing["month"])}
+            row = conn.execute("SELECT * FROM reservations WHERE reservation_id=?",
+                               (reservation_id,)).fetchone()
+            if row is None:
+                raise errors.NotFound(
+                    f"预占不存在：{reservation_id}",
+                    code="Q_LEDGER_NO_RESERVATION",
+                    detail={"reservation_id": reservation_id})
+            reservation = dict(row)
+            if reservation["status"] == "SETTLED":
+                raise errors.Conflict(
+                    f"预占 {reservation_id} 已结算，不能重复记账",
+                    code="Q_LEDGER_SETTLED",
+                    detail={"reservation_id": reservation_id})
+            late = 1 if reservation["status"] == "CANCELLED" else 0
+            if reservation["status"] == "HELD":
+                conn.execute(
+                    "UPDATE reservations SET status='SETTLED', updated_at=? "
+                    "WHERE reservation_id=?", (now, reservation_id))
+            settlement = {"receipt_id": receipt_id,
+                          "reservation_id": reservation_id,
+                          "dept": reservation["dept"],
+                          "month": reservation["month"],
+                          "actual_cents": int(actual_cents), "late": late,
+                          "created_at": now}
+            self._ledger_insert_settlement(conn, settlement)
+            return {"settlement": settlement, "duplicate": False,
+                    "late": bool(late),
+                    "status": self._ledger_status(conn, reservation["dept"],
+                                                  reservation["month"])}
+
+    def _ledger_insert_settlement(self, conn, settlement: dict) -> None:
+        """单条实账落库；独立成方法，故障注入测试在此模拟结算中途断电。"""
+        conn.execute(
+            """INSERT INTO settlements (receipt_id,reservation_id,dept,month,
+                   actual_cents,late,created_at) VALUES (?,?,?,?,?,?,?)""",
+            (settlement["receipt_id"], settlement["reservation_id"],
+             settlement["dept"], settlement["month"],
+             int(settlement["actual_cents"]), int(settlement["late"]),
+             settlement["created_at"]))
+
+    def ledger_cancel(self, *, reservation_id: str, now: str) -> dict:
+        """撤销未执行的预占并释放额度；已结算的不能撤销；重复撤销幂等。"""
+        from . import errors
+        with self.connect(immediate=True) as conn:
+            row = conn.execute("SELECT * FROM reservations WHERE reservation_id=?",
+                               (reservation_id,)).fetchone()
+            if row is None:
+                raise errors.NotFound(
+                    f"预占不存在：{reservation_id}",
+                    code="Q_LEDGER_NO_RESERVATION",
+                    detail={"reservation_id": reservation_id})
+            reservation = dict(row)
+            if reservation["status"] == "SETTLED":
+                raise errors.Conflict(
+                    f"预占 {reservation_id} 已结算，不能撤销",
+                    code="Q_LEDGER_SETTLED",
+                    detail={"reservation_id": reservation_id})
+            if reservation["status"] == "HELD":
+                conn.execute(
+                    "UPDATE reservations SET status='CANCELLED', updated_at=? "
+                    "WHERE reservation_id=?", (now, reservation_id))
+                reservation["status"] = "CANCELLED"
+                reservation["updated_at"] = now
+            return {"reservation": reservation,
+                    "status": self._ledger_status(conn, reservation["dept"],
+                                                  reservation["month"])}
+
+    def ledger_get_reservation(self, reservation_id: str) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM reservations WHERE reservation_id=?",
+                               (reservation_id,)).fetchone()
+        return dict(row) if row else None
+
+    def ledger_list_reservations(self, *, dept: str | None = None,
+                                 month: str | None = None,
+                                 status: str | None = None,
+                                 limit: int = 200) -> list[dict]:
+        sql = "SELECT * FROM reservations WHERE 1=1"
+        args: list = []
+        if dept:
+            sql += " AND dept=?"
+            args.append(dept)
+        if month:
+            sql += " AND month=?"
+            args.append(month)
+        if status:
+            sql += " AND status=?"
+            args.append(status)
+        sql += " ORDER BY created_at, reservation_id LIMIT ?"
+        args.append(int(limit))
+        with self.connect() as conn:
+            return [dict(r) for r in conn.execute(sql, args).fetchall()]
+
+    def ledger_list_settlements(self, *, dept: str | None = None,
+                                month: str | None = None,
+                                limit: int = 200) -> list[dict]:
+        sql = "SELECT * FROM settlements WHERE 1=1"
+        args: list = []
+        if dept:
+            sql += " AND dept=?"
+            args.append(dept)
+        if month:
+            sql += " AND month=?"
+            args.append(month)
+        sql += " ORDER BY created_at, receipt_id LIMIT ?"
+        args.append(int(limit))
+        with self.connect() as conn:
+            return [dict(r) for r in conn.execute(sql, args).fetchall()]
 
     def _all(self, sql: str, args: tuple) -> list[dict]:
         with self.connect() as conn:

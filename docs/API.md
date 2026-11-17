@@ -15,6 +15,13 @@
 | POST | `/api/appeals` | 提交申诉（一条或多条），改判后重算并升版本 | 400 请求形状、404 `Q_NO_BATCH`、409 `Q_STALE_VERSION`、422 `Q_APPEAL_NONE` `Q_APPEAL_BUCKET` `Q_APPEAL_IMBALANCE` |
 | POST | `/api/appeals/rollback` | 按版本快照回滚，写成一个新版本 | 400 缺 `to_version`、404 `Q_ROLLBACK_TARGET`、409 `Q_ROLLBACK_SAME` `Q_STALE_VERSION` |
 | GET | `/api/appeals` | 申诉记录、版本时间线、版本差异与四账（可带 `left` / `right`） | 404 `Q_NO_BATCH` |
+| PUT | `/api/ledger/budget` | 设定部门月度预算（`budget_cents` 或 `budget_yuan`，`month` 缺省本月） | 400 `E_BAD_REQUEST`、`Q_LEDGER_BAD_MONTH` |
+| POST | `/api/ledger/reserve` | 按预估费用预占额度（可带 `reservation_id` 作幂等键） | 400、404 `Q_LEDGER_NO_BUDGET`、409 `Q_LEDGER_OVER_BUDGET` `Q_LEDGER_RESERVE_CONFLICT` |
+| POST | `/api/ledger/settle` | 执行回执结算，全额记账（`receipt_id` 幂等，超额记欠额） | 400、404 `Q_LEDGER_NO_RESERVATION`、409 `Q_LEDGER_SETTLED` `Q_LEDGER_RECEIPT_CONFLICT` |
+| POST | `/api/ledger/cancel` | 撤销未执行的预占（重复撤销幂等） | 404 `Q_LEDGER_NO_RESERVATION`、409 `Q_LEDGER_SETTLED` |
+| GET | `/api/ledger/status?dept=&month=` | 本月已用 / 预占 / 可用 / 欠额（整数分） | 400 `E_BAD_REQUEST` |
+| GET | `/api/ledger/reservations?dept=&month=&status=` | 预占清单（对账与中断恢复入口） | 400 `E_BAD_REQUEST` |
+| GET | `/api/ledger/settlements?dept=&month=` | 实账清单（含 `late` 晚到标记） | 400 `Q_LEDGER_BAD_MONTH` |
 | GET | `/healthz` | 存活探测 | — |
 
 页面：`/` 账单接入、`/allocations` 分摊结果、`/gates` 闸门决策、`/appeals` 申诉回滚、`/quarantine` 异常查询、`/batches` 批次清单（可打印）、`/export` 导出。
